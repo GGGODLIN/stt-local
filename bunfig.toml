@@ -1,0 +1,3 @@
+# A dependency version must have been on the registry for 7 days before it installs.
+[install]
+minimumReleaseAge = 604800
