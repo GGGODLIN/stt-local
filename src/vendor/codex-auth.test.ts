@@ -272,6 +272,28 @@ describe("the codex auth broker — refresh is shared, never raced", () => {
     expect(fake.written.filter((frame) => frame.params?.refreshToken === true)).toHaveLength(2);
     broker.close();
   });
+
+  test("refresh retires a running child so a replaced ~/.codex/auth.json is reloaded from disk", async () => {
+    const stale = fakeAppServer({ token: "stale-token" });
+    const fresh = fakeAppServer({ token: "fresh-token" });
+    const children = [stale, fresh];
+    const broker = createCodexAuthBroker({
+      codexBin: "codex",
+      spawn: () => {
+        const next = children.shift();
+        if (next === undefined) throw new Error("spawned more children than the test allows");
+        return next.process;
+      },
+    });
+
+    expect(await broker.accessToken(false)).toEqual({ accessToken: "stale-token" });
+    expect(stale.killed).toBe(false);
+
+    expect(await broker.accessToken(true)).toEqual({ accessToken: "fresh-token" });
+    expect(stale.killed).toBe(true);
+    expect(fresh.written.filter((frame) => frame.params?.refreshToken === true)).toHaveLength(1);
+    broker.close();
+  });
 });
 
 describe("the codex auth broker — a dead child", () => {

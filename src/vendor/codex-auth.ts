@@ -151,6 +151,9 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
     // a lock, because the only thing that must not happen twice is the round trip itself.
     const inflight = this.refreshing;
     if (inflight !== null) return inflight;
+    // Retire any running child before refreshing: `codex app-server` caches `~/.codex/auth.json`
+    // in memory at startup, so a sign-in replaced on disk is invisible until a fresh child starts.
+    this.retire();
     const started = this.fetchToken(true).finally(() => {
       if (this.refreshing === started) this.refreshing = null;
     });
@@ -160,12 +163,16 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
 
   close(): void {
     this.closed = true;
+    this.retire("the Codex app-server was shut down");
+  }
+
+  private retire(reason = "the Codex app-server was restarted to reload sign-in"): void {
     const child = this.child;
     this.child = null;
     this.starting = null;
     this.buffer = "";
     child?.kill();
-    this.failPending(new SttError("unavailable", "the Codex app-server was shut down"));
+    this.failPending(new SttError("unavailable", reason));
   }
 
   /** A token, with the authMethod already judged. Records the outcome in {@link lastKnown}. */
