@@ -36,7 +36,8 @@ interface FakeAppServer {
   killed: boolean;
   /** Flush the answers held back by `hold`. */
   release(): void;
-  /** Emit a raw stdout line, newline included by the fake. For stale-bytes and garbage cases. */
+  /** Emit raw stdout bytes, including a newline only when the sender supplies one. */
+  chunk(text: string): void;
   emit(line: string): void;
   /** Report the child as gone, the way a real exit would. */
   die(reason: string): void;
@@ -53,8 +54,11 @@ function fakeAppServer(config: FakeConfig = {}): FakeAppServer {
   const fake: FakeAppServer = {
     written: [],
     killed: false,
+    chunk(text) {
+      stdout?.(new TextEncoder().encode(text));
+    },
     emit(line) {
-      stdout?.(new TextEncoder().encode(`${line}\n`));
+      fake.chunk(`${line}\n`);
     },
     release() {
       const queued = held.splice(0, held.length);
@@ -262,6 +266,27 @@ describe("the codex auth broker — refresh is shared, never raced", () => {
     broker.close();
   });
 
+  test("ordinary token requests join an in-progress refresh", async () => {
+    const fake = fakeAppServer({ hold: true });
+    const broker = createCodexAuthBroker({ codexBin: "fake", spawn: () => fake.process });
+    try {
+      const renewal = broker.accessToken(true);
+      await written(fake, 3);
+      const ordinary = broker.accessToken();
+      await Promise.resolve();
+      await Promise.resolve();
+      fake.release();
+      expect(await Promise.all([renewal, ordinary])).toEqual([
+        { accessToken: "access-token" },
+        { accessToken: "access-token" },
+      ]);
+      const authRequests = fake.written.filter((frame) => frame.method === "getAuthStatus");
+      expect(authRequests.map((frame) => frame.params?.refreshToken)).toEqual([true]);
+    } finally {
+      broker.close();
+    }
+  });
+
   test("a later refresh is a new round trip — the sharing is per flight, not a cache", async () => {
     const fake = fakeAppServer();
     const broker = createCodexAuthBroker({ codexBin: "codex", spawn: () => fake.process });
@@ -319,6 +344,52 @@ describe("the codex auth broker — a dead child", () => {
     expect(await broker.accessToken()).toEqual({ accessToken: "access-token" });
     expect(methods(second)).toEqual(["initialize", "initialized", "getAuthStatus"]);
     broker.close();
+  });
+
+  test("a completed but superseded handshake does not write to the replacement", async () => {
+    const first = fakeAppServer({ answerInitialize: false });
+    const second = fakeAppServer({ answerInitialize: false });
+    const children = [first, second];
+    const broker = createCodexAuthBroker({
+      codexBin: "fake",
+      spawn: () => children.shift()!.process,
+      requestTimeoutMs: 200,
+    });
+    try {
+      const old = broker.accessToken().catch((error: Error) => error);
+      first.emit(JSON.stringify({ id: first.written[0]?.id, result: {} }));
+      const renewed = broker.accessToken(true).catch((error: Error) => error);
+      await Promise.resolve();
+      const beforeHandshake = methods(second);
+      second.emit(JSON.stringify({ id: second.written[0]?.id, result: {} }));
+      expect(await renewed).toEqual({ accessToken: "access-token" });
+      expect(beforeHandshake).toEqual(["initialize"]);
+      expect(await old).toBeInstanceOf(SttError);
+      expect(methods(second)).toEqual(["initialize", "initialized", "getAuthStatus"]);
+    } finally {
+      broker.close();
+    }
+  });
+
+  test("an oversized unterminated frame retires the child before the RPC times out", async () => {
+    const first = fakeAppServer({ hold: true });
+    const second = fakeAppServer();
+    const children = [first, second];
+    const broker = createCodexAuthBroker({
+      codexBin: "fake",
+      spawn: () => children.shift()!.process,
+      requestTimeoutMs: 200,
+    });
+    try {
+      const pending = broker.accessToken().catch((error: Error) => error);
+      await written(first, 3);
+      first.chunk("x".repeat(2 * 1024 * 1024));
+      expect(first.killed).toBe(true);
+      expect(await pending).toMatchObject({ message: expect.stringContaining("frame") });
+      expect(await broker.accessToken()).toEqual({ accessToken: "access-token" });
+    } finally {
+      broker.close();
+    }
   });
 
   test("a child that exits is respawned lazily, on the next demand and not before", async () => {

@@ -64,7 +64,7 @@ export function extensionFor(type: string, name: string): string | null {
   return byName !== undefined && KNOWN_EXTENSIONS.has(byName) ? byName : null;
 }
 
-const STATUS_BY_KIND = { timeout: 504, oversized: 413, refused: 502, unavailable: 503 } as const;
+const STATUS_BY_KIND = { timeout: 504, oversized: 502, refused: 502, unavailable: 503 } as const;
 
 export function createHandler(deps: HandlerDeps): (req: Request) => Promise<Response> {
   const now = deps.now ?? Date.now;
@@ -77,6 +77,9 @@ export function createHandler(deps: HandlerDeps): (req: Request) => Promise<Resp
     try {
       form = await req.formData();
     } catch {
+      if (req.signal.aborted) {
+        return { response: openAiError(499, "the caller went away"), bytes: 0, error: "cancelled" };
+      }
       return { response: openAiError(400, "expected a multipart form"), bytes: 0 };
     }
     const file = form.get("file");
@@ -101,7 +104,7 @@ export function createHandler(deps: HandlerDeps): (req: Request) => Promise<Resp
       if (err instanceof SttError) {
         return { response: openAiError(STATUS_BY_KIND[err.kind], err.message), bytes, error: err.message };
       }
-      if (err instanceof SttCancelledError) {
+      if (err instanceof SttCancelledError || req.signal.aborted) {
         return { response: openAiError(499, "the caller went away"), bytes, error: "cancelled" };
       }
       return { response: openAiError(500, "transcription failed"), bytes, error: String(err) };

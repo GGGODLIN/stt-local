@@ -63,8 +63,8 @@ export interface CodexAuthBroker {
   /**
    * A token, spawning and handshaking the child if that is what it takes.
    *
-   * `refresh` asks Codex to renew the underlying session first. Concurrent refreshes SHARE one
-   * round trip: two phones that both hit a 401 must not race two renewals at the identity provider.
+   * `refresh` asks Codex to renew the underlying session first. Once a refresh starts, all token
+   * callers share it so they neither race renewals nor request a token while it is being renewed.
    */
   accessToken(refresh?: boolean): Promise<CodexAccessToken>;
   /** Ask for real, and record the answer in {@link lastKnown}. What `collie stt test` drives. */
@@ -87,6 +87,10 @@ export interface CodexAuthBrokerOptions {
 /** One JSON-RPC round trip's budget. Generous for a local handshake, short enough to fail a hang. */
 export const CODEX_REQUEST_TIMEOUT_MS = 10_000;
 
+/** Maximum per-child buffered stdout bytes before an unterminated line retires the child. */
+export const MAX_STDOUT_BUFFER_BYTES = 1024 * 1024;
+const OVERSIZED_FRAME_REASON = "the Codex app-server sent an oversized stdout frame";
+
 /** The state a broker reports before anything has actually been asked of Codex. */
 export const CODEX_UNPROBED: SttStatus = {
   available: false,
@@ -97,6 +101,15 @@ interface PendingRequest {
   resolve(value: JsonValue): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface ChildSession {
+  readonly child: CodexAppServerProcess;
+  readonly decoder: TextDecoder;
+  buffer: string;
+  ready: boolean;
+  retired: boolean;
+  readonly pending: Map<number, PendingRequest>;
 }
 
 /** What `getAuthStatus` said, after narrowing. Both fields are absent-able on the wire. */
@@ -115,13 +128,10 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
   private readonly requestTimeoutMs: number;
   private readonly clientVersion: string;
 
-  private child: CodexAppServerProcess | null = null;
-  private starting: Promise<void> | null = null;
+  private session: ChildSession | null = null;
+  private starting: Promise<ChildSession> | null = null;
   private refreshing: Promise<CodexAccessToken> | null = null;
   private nextId = 1;
-  private buffer = "";
-  private decoder = new TextDecoder();
-  private readonly pending = new Map<number, PendingRequest>();
   private known: SttStatus = CODEX_UNPROBED;
   private closed = false;
 
@@ -141,16 +151,17 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
       await this.authenticatedStatus(false, false);
       return this.known;
     } catch (err) {
+      if (this.closed) return this.known;
       return err instanceof SttError ? { available: false, reason: err.message } : { available: false };
     }
   }
 
   async accessToken(refresh = false): Promise<CodexAccessToken> {
-    if (!refresh) return this.fetchToken(false);
     // A refresh in flight is a refresh everyone joins. Serialized behind this one tail rather than
     // a lock, because the only thing that must not happen twice is the round trip itself.
     const inflight = this.refreshing;
     if (inflight !== null) return inflight;
+    if (!refresh) return this.fetchToken(false);
     // Retire any running child before refreshing: `codex app-server` caches `~/.codex/auth.json`
     // in memory at startup, so a sign-in replaced on disk is invisible until a fresh child starts.
     this.retire();
@@ -163,16 +174,29 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
 
   close(): void {
     this.closed = true;
+    this.known = { available: false, reason: "the Codex app-server was shut down" };
     this.retire("the Codex app-server was shut down");
   }
 
   private retire(reason = "the Codex app-server was restarted to reload sign-in"): void {
-    const child = this.child;
-    this.child = null;
-    this.starting = null;
-    this.buffer = "";
-    child?.kill();
-    this.failPending(new SttError("unavailable", reason));
+    const session = this.session;
+    if (session === null) {
+      this.starting = null;
+      return;
+    }
+    this.retireSession(session, reason);
+  }
+
+  private retireSession(session: ChildSession, reason: string): void {
+    if (session.retired) return;
+    session.retired = true;
+    if (this.session === session) {
+      this.session = null;
+      this.starting = null;
+    }
+    session.buffer = "";
+    session.child.kill();
+    this.failPending(session, new SttError("unavailable", reason));
   }
 
   /** A token, with the authMethod already judged. Records the outcome in {@link lastKnown}. */
@@ -195,7 +219,7 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
   private async authenticatedStatus(includeToken: boolean, refreshToken: boolean): Promise<AuthStatus> {
     const auth = readAuthStatus(await this.request("getAuthStatus", { includeToken, refreshToken }));
     if (auth.authMethod === "chatgpt") {
-      this.known = { available: true };
+      if (!this.closed) this.known = { available: true };
       return auth;
     }
     if (auth.authMethod === "apikey" || auth.authMethod === "api_key") {
@@ -210,100 +234,156 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
 
   /** Record a refusal as the last known state and return it as the error to throw. */
   private remember(reason: string): SttError {
-    this.known = { available: false, reason };
+    if (!this.closed) {
+      this.known = { available: false, reason };
+    }
     return new SttError("unavailable", reason);
   }
 
   private async request(method: string, params: JsonValue): Promise<JsonValue> {
-    if (this.closed) throw new SttError("unavailable", "speech-to-text was shut down");
-    await this.ensureStarted();
-    return this.send(method, params);
-  }
-
-  private async ensureStarted(): Promise<void> {
-    const starting = this.starting;
-    if (starting !== null) return starting;
-    if (this.child !== null) return;
-    const attempt = this.start();
-    this.starting = attempt;
-    try {
-      await attempt;
-    } finally {
-      if (this.starting === attempt) this.starting = null;
+    for (;;) {
+      if (this.closed) throw new SttError("unavailable", "speech-to-text was shut down");
+      const session = await this.ensureStarted();
+      if (this.closed) throw new SttError("unavailable", "speech-to-text was shut down");
+      if (this.session !== session || !session.ready || session.retired) continue;
+      return this.sendOn(session, method, params);
     }
   }
 
-  private async start(): Promise<void> {
+  private async ensureStarted(): Promise<ChildSession> {
+    for (;;) {
+      if (this.closed) throw new SttError("unavailable", "speech-to-text was shut down");
+      const starting = this.starting;
+      if (starting !== null) {
+        const session = await starting;
+        if (this.session === session && session.ready && !session.retired) return session;
+        continue;
+      }
+      const current = this.session;
+      if (current !== null && current.ready && !current.retired) return current;
+      const attempt = this.start();
+      this.starting = attempt;
+      try {
+        const session = await attempt;
+        if (this.session === session && session.ready && !session.retired) return session;
+      } finally {
+        if (this.starting === attempt) this.starting = null;
+      }
+    }
+  }
+
+  private async start(): Promise<ChildSession> {
     let child: CodexAppServerProcess;
     try {
       child = this.spawnProcess(this.codexBin);
     } catch (err) {
       throw this.remember(spawnFailure(err instanceof Error ? err : null, this.codexBin));
     }
-    this.child = child;
-    this.buffer = "";
-    this.decoder = new TextDecoder();
-    child.onStdout((chunk) => this.onStdout(child, chunk));
+    const session: ChildSession = {
+      child,
+      decoder: new TextDecoder(),
+      buffer: "",
+      ready: false,
+      retired: false,
+      pending: new Map(),
+    };
+    this.session = session;
+    child.onStdout((chunk) => this.onStdout(session, chunk));
     // Drained and discarded, never logged: app-server writes diagnostics here, and a diagnostic
     // that quoted a token would put it in the journal forever. An UNREAD pipe would also fill and
     // wedge the child, so the listener has to exist even though it does nothing.
     child.onStderr(() => {});
-    child.onExit((reason) => this.onDeath(child, reason));
+    child.onExit((reason) => this.onDeath(session, reason));
 
     try {
-      await this.send("initialize", {
+      await this.sendOn(session, "initialize", {
         clientInfo: { name: "stt-local", title: "stt-local", version: this.clientVersion },
       });
-      this.write({ method: "initialized", params: {} });
+      if (this.closed) throw new SttError("unavailable", "speech-to-text was shut down");
+      if (session.retired || this.session !== session) {
+        throw new SttError("unavailable", "the Codex app-server handshake was superseded");
+      }
+      this.writeOn(session, { method: "initialized", params: {} });
+      if (!this.closed && !session.retired && this.session === session) {
+        session.ready = true;
+      }
+      return session;
     } catch (err) {
       // A timed-out initialize leaves a live but unusable child. Retire THIS one so the next demand
       // handshakes from scratch, and make sure its late exit cannot tear down the replacement.
-      if (this.child === child) this.child = null;
-      child.kill();
-      this.buffer = "";
+      const reason = err instanceof Error ? err.message : "the Codex app-server could not initialize";
+      this.retireSession(session, reason);
       throw err;
     }
   }
 
-  private send(method: string, params: JsonValue): Promise<JsonValue> {
+  private sendOn(session: ChildSession, method: string, params: JsonValue): Promise<JsonValue> {
+    if (this.closed) {
+      return Promise.reject(new SttError("unavailable", "speech-to-text was shut down"));
+    }
+    if (session.retired || this.session !== session) {
+      return Promise.reject(new SttError("unavailable", "the Codex app-server is not running"));
+    }
     const id = this.nextId++;
     return new Promise<JsonValue>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(this.remember(`the Codex app-server did not answer \`${method}\` in time`));
+        session.pending.delete(id);
+        const error = this.remember(`the Codex app-server did not answer \`${method}\` in time`);
+        reject(error);
+        this.retireSession(session, error.message);
       }, this.requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      session.pending.set(id, { resolve, reject, timer });
       try {
-        this.write({ id, method, params });
+        this.writeOn(session, { id, method, params });
       } catch (err) {
         clearTimeout(timer);
-        this.pending.delete(id);
-        reject(err instanceof SttError ? err : new SttError("unavailable"));
+        session.pending.delete(id);
+        const error = err instanceof SttError ? err : this.remember("the Codex app-server is not running");
+        reject(error);
+        this.retireSession(session, error.message);
       }
     });
   }
 
-  private write(message: JsonValue): void {
-    const child = this.child;
-    if (child === null) throw this.remember("the Codex app-server is not running");
-    child.stdin.write(`${JSON.stringify(message)}\n`);
+  private writeOn(session: ChildSession, message: JsonValue): void {
+    if (session.retired || this.session !== session) {
+      throw this.remember("the Codex app-server is not running");
+    }
+    session.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  private onStdout(child: CodexAppServerProcess, chunk: Uint8Array): void {
+  private onStdout(session: ChildSession, chunk: Uint8Array): void {
     // A retired child can still flush stdout after its replacement has started. Stale bytes must
     // never enter the replacement's frame buffer, and a stale id must never resolve a live request.
-    if (this.child !== child) return;
-    this.buffer += this.decoder.decode(chunk, { stream: true });
+    if (session.retired || this.session !== session) return;
+    if (chunk.byteLength > MAX_STDOUT_BUFFER_BYTES && !chunk.includes(10)) {
+      const error = this.remember(OVERSIZED_FRAME_REASON);
+      this.retireSession(session, error.message);
+      return;
+    }
+    session.buffer += session.decoder.decode(chunk, { stream: true });
     for (;;) {
-      const newline = this.buffer.indexOf("\n");
-      if (newline < 0) return;
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      if (line.trim() !== "") this.onFrame(line);
+      const newline = session.buffer.indexOf("\n");
+      if (newline < 0) {
+        if (Buffer.byteLength(session.buffer, "utf8") > MAX_STDOUT_BUFFER_BYTES) {
+          const error = this.remember(OVERSIZED_FRAME_REASON);
+          this.retireSession(session, error.message);
+        }
+        return;
+      }
+      const line = session.buffer.slice(0, newline);
+      session.buffer = session.buffer.slice(newline + 1);
+      if (Buffer.byteLength(line, "utf8") > MAX_STDOUT_BUFFER_BYTES) {
+        const error = this.remember(OVERSIZED_FRAME_REASON);
+        this.retireSession(session, error.message);
+        return;
+      }
+      if (line.trim() !== "") this.onFrame(session, line);
+      if (session.retired || this.session !== session) return;
     }
   }
 
-  private onFrame(line: string): void {
+  private onFrame(session: ChildSession, line: string): void {
     let parsed: JsonValue;
     try {
       // SAFETY: `JSON.parse` output IS a JsonValue by construction, and every field below is read
@@ -316,10 +396,10 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
     if (frame === null) return;
     const id = jsonNumberField(frame.id);
     if (id === null) return; // A notification, or an answer to a request this process did not send.
-    const request = this.pending.get(id);
+    const request = session.pending.get(id);
     if (request === undefined) return;
     clearTimeout(request.timer);
-    this.pending.delete(id);
+    session.pending.delete(id);
     const failure = jsonRecord(frame.error);
     if (failure !== null) {
       request.reject(this.remember(jsonStringField(failure.message) ?? "the Codex app-server refused"));
@@ -328,20 +408,18 @@ class CodexAppServerAuthBroker implements CodexAuthBroker {
     request.resolve(frame.result ?? null);
   }
 
-  private onDeath(child: CodexAppServerProcess, reason: string): void {
-    if (this.child !== child) return;
-    this.child = null;
-    this.starting = null;
-    this.buffer = "";
-    this.failPending(this.remember(reason));
+  private onDeath(session: ChildSession, reason: string): void {
+    if (session.retired || this.session !== session) return;
+    const error = this.remember(reason);
+    this.retireSession(session, error.message);
   }
 
-  private failPending(error: Error): void {
-    for (const request of this.pending.values()) {
+  private failPending(session: ChildSession, error: Error): void {
+    for (const request of session.pending.values()) {
       clearTimeout(request.timer);
       request.reject(error);
     }
-    this.pending.clear();
+    session.pending.clear();
   }
 }
 

@@ -202,6 +202,33 @@ describe("the codex provider — a lapsed session", () => {
     expect(broker.refreshes).toEqual([false, true]);
   });
 
+  test("two callers survive one cancelled wait on a shared refresh", async () => {
+    const renewed = held<{ accessToken: string }>();
+    const bothWaiting = held<void>();
+    let waiting = 0;
+    const broker = fakeBroker();
+    broker.accessToken = async (refresh = false) => {
+      if (!refresh) return { accessToken: flatClaimToken("acct-123") };
+      if (++waiting === 2) bothWaiting.resolve();
+      return renewed.promise;
+    };
+    const { fetch, calls } = recorder((call) =>
+      call <= 2 ? new Response("expired", { status: 401 }) : Response.json({ text: "kept going" }),
+    );
+    const first = new AbortController();
+    const provider = createCodexSttProvider(HONEST, { broker, fetch, prime: false, version: "1.2.3" });
+    const cancelled = provider.transcribe({ ...CLIP, filename: "cancelled.webm" }, first.signal);
+    const active = provider.transcribe({ ...CLIP, filename: "active.webm" });
+    await bothWaiting.promise;
+    first.abort();
+    await expect(cancelled).rejects.toBeInstanceOf(SttCancelledError);
+    expect(calls).toHaveLength(2);
+    renewed.resolve({ accessToken: flatClaimToken("acct-123") });
+    expect(await active).toEqual({ text: "kept going" });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.body?.get("file")).toMatchObject({ name: "active.webm" });
+  });
+
   test("a caller that cancels during the one 401 refresh never uploads the clip again", async () => {
     const broker = fakeBroker();
     const renewed = held<{ accessToken: string }>();

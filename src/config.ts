@@ -18,30 +18,34 @@ export function configPath(env: Record<string, string | undefined> = process.env
   return env.STT_LOCAL_CONFIG ?? join(homedir(), ".config", "stt-local", "config.json");
 }
 
-interface RawConfig {
-  port?: number;
-  apiKey?: string;
-  codexBin?: string;
-  wireIdentity?: string;
-  convert?: string;
-}
-
 /** The config, or the reason it cannot run. A missing key is refused, never defaulted to open. */
 export type ParsedConfig = { ok: true; config: ServiceConfig } | { ok: false; reason: string };
 
-export function parseConfig(raw: RawConfig): ParsedConfig {
+export function parseConfig(raw: unknown): ParsedConfig {
   const refuse = (reason: string): ParsedConfig => ({ ok: false, reason });
-  if (!raw.apiKey || raw.apiKey.length < 16) return refuse("apiKey is missing or shorter than 16 characters");
-  if (!raw.codexBin) return refuse("codexBin is missing");
-  const wireIdentity = raw.wireIdentity ?? "honest";
-  if (wireIdentity !== "honest" && wireIdentity !== "codex-cli") {
-    return refuse(`unknown wireIdentity "${wireIdentity}"`);
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return refuse("config must be a JSON object");
   }
-  if (raw.convert !== undefined && raw.convert !== "zh-TW") return refuse(`unknown convert "${raw.convert}"`);
-  const port = raw.port ?? DEFAULT_PORT;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return refuse(`bad port ${port}`);
-  const config: ServiceConfig = { port, apiKey: raw.apiKey, codexBin: raw.codexBin, wireIdentity };
-  if (raw.convert !== undefined) config.convert = raw.convert;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.apiKey !== "string" || obj.apiKey.length < 16) {
+    return refuse("apiKey is missing or shorter than 16 characters");
+  }
+  if (typeof obj.codexBin !== "string" || obj.codexBin.length === 0) {
+    return refuse("codexBin is missing");
+  }
+  if (obj.wireIdentity !== undefined && obj.wireIdentity !== "honest" && obj.wireIdentity !== "codex-cli") {
+    return refuse(`unknown wireIdentity "${String(obj.wireIdentity)}"`);
+  }
+  const wireIdentity: SttWireIdentity = obj.wireIdentity ?? "honest";
+  if (obj.convert !== undefined && obj.convert !== "zh-TW") {
+    return refuse(`unknown convert "${String(obj.convert)}"`);
+  }
+  const port = obj.port ?? DEFAULT_PORT;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return refuse(`bad port ${String(port)}`);
+  }
+  const config: ServiceConfig = { port, apiKey: obj.apiKey, codexBin: obj.codexBin, wireIdentity };
+  if (obj.convert !== undefined) config.convert = obj.convert;
   return { ok: true, config };
 }
 

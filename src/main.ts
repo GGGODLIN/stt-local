@@ -30,10 +30,20 @@ const server = Bun.serve({
 
 console.log(JSON.stringify({ at: new Date().toISOString(), listening: `http://127.0.0.1:${server.port}/v1` }));
 
-function shutdown(): void {
-  provider.close?.();
-  void server.stop();
+let shuttingDown = false;
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await server.stop();
+  } finally {
+    provider.close?.();
+  }
   process.exit(0);
 }
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on("SIGTERM", () => {
+  void shutdown();
+});
+process.on("SIGINT", () => {
+  void shutdown();
+});

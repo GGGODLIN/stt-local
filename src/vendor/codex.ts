@@ -120,12 +120,14 @@ export function createCodexSttProvider(settings: CodexSttSettings, deps: CodexSt
           deadline.throwIfAborted();
           throw new SttError("refused", "the Codex transcription endpoint tried to redirect the upload");
         }
-        const body = await deadline.wait(readCapped(response, deadline.signal));
         if (!response.ok) {
+          await deadline.wait(discardBody(response));
+          deadline.throwIfAborted();
           // The status, and only the status. The body of a ChatGPT error can name the account, the
           // plan and an internal request id, and none of that belongs in a browser.
           throw new SttError("refused", codexRefusal(response.status));
         }
+        const body = await deadline.wait(readCapped(response, deadline.signal));
         return { text: parseTranscript(body) };
       } catch (err) {
         deadline.throwIfAborted();
